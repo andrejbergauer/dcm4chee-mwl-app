@@ -2,17 +2,12 @@
 
 block_cipher = None
 
-import os
-import sys
-
-# Directory where the script lives (repo root)
-script_dir = os.path.dirname(os.path.abspath(__file__))
-
-# logo.png naj bo zraven mwl_app.py v repozitoriju
+# Dodatne datoteke, ki jih želimo zraven .exe
 datas = [
-    ('logo.png', '.'),  # skopira logo.png v isti folder kot .exe
+    ('logo.png', '.'),  # kopira logo.png v isti folder kot exe
 ]
 
+# Moduli, ki jih PyInstaller mogoče sam ne najde
 hiddenimports = [
     'pdfplumber',
     'pdfminer',
@@ -28,8 +23,8 @@ hiddenimports = [
 ]
 
 a = Analysis(
-    ['mwl_app.py'],
-    pathex=[script_dir],
+    ['mwl_app.py'],   # skripta mora biti v rootu repozitorija
+    pathex=['.'],     # trenutni direktorij (GitHub runner checkout)
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,
