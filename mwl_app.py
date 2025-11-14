@@ -9,11 +9,12 @@ DCM4CHEE MWL — Enostavna lokalna aplikacija (SL)
 ✔ SAMODEJNI Accession Number (ACCYYYYMMDD-####), privzeto vklopljeno
 """
 
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, send_from_directory
 import requests
 from requests.auth import HTTPBasicAuth
 from datetime import datetime
-import os, json, re
+import os, json, re, io
+import pdfplumber
 
 # utišaj opozorila za samopodpisan certifikat (po potrebi)
 import urllib3
@@ -23,11 +24,30 @@ app = Flask(__name__)
 
 # ---------- Privzeta nastavitev ----------
 CFG = {
-    "server_base": "https://192.168.1.40:30007/dcm4chee-arc",
+    # privzeta (lahko spremeniš v poljubno od spodnjih dveh)
+    "server_base": "https://192.168.123.220:30007/dcm4chee-arc",
     "aet": "WORKLIST",
     "username": "admin",
-    "password": "admin",
+    "password": "ksenija",
     "allow_self_signed": True,
+}
+
+# Dve pripravljeni konfiguraciji (UI ju ponudi kot izbiro, vrednosti lahko ročno popraviš)
+CONFIG_PRESETS = {
+    "pacs1": {
+        "label": "PACS 1 (192.168.123.220)",
+        "server_base": "https://192.168.123.220:30007/dcm4chee-arc",
+        "username": "admin",
+        "password": "ksenija",
+        "allow_self_signed": True,
+    },
+    "pacs2": {
+        "label": "PACS 2 (192.168.1.40)",
+        "server_base": "https://192.168.1.40:30007/dcm4chee-arc",
+        "username": "admin",
+        "password": "tobi78nLJ5",
+        "allow_self_signed": True,
+    },
 }
 
 COUNTER_FILE = "pid_counter.json"
@@ -251,6 +271,7 @@ def dicom_mwl_to_simple(ds):
         "patientName": _get_str(ds, "00100010"),
         "patientId":   _get_str(ds, "00100020"),
         "accessionNumber": _get_str(ds, "00080050"),
+        "procedureDescription": _get_str(ds, "00321060"),
         "studyInstanceUID": _get_str(ds, "0020000D"),
         "scheduledProcedureStep": []
     }
@@ -356,6 +377,69 @@ def api_remove():
 
     return jsonify({"ok": resp.ok, "status": resp.status_code, "response": body}), (200 if resp.ok else resp.status_code)
 
+
+# ---------- BRISANJE VSEH MWL ELEMENTOV ----------
+@app.post('/api/remove_all')
+def api_remove_all():
+    """
+    Izbriše vse MWL elemente na trenutnem AET.
+    """
+    # Najprej pridobimo vse MWL elemente
+    r = arc_get(f"/aets/{CFG['aet']}/rs/mwlitems", {"Accept": "application/dicom+json"})
+    if not r.ok:
+        return Response(r.text, status=r.status_code)
+
+    try:
+        arr = r.json()
+    except Exception:
+        return jsonify({"ok": False, "napaka": "Nepričakovan odgovor PACS.", "odgovor": r.text}), 502
+
+    if not isinstance(arr, list):
+        return jsonify({"ok": True, "deleted": [], "errors": []})
+
+    deleted = []
+    errors = []
+
+    for ds in arr:
+        if not isinstance(ds, dict):
+            continue
+        # StudyInstanceUID
+        try:
+            val_uid = (ds.get("0020000D", {}) or {}).get("Value") or []
+            studyuid = str(val_uid[0]) if val_uid else ""
+        except Exception:
+            studyuid = ""
+
+        # ScheduledProcedureStepSequence (00400100)
+        sps_seq = (ds.get("00400100", {}) or {})
+        items = sps_seq.get("Value") or []
+        for item in items:
+            try:
+                val_sps = (item.get("00400009", {}) or {}).get("Value") or []
+                spsid = str(val_sps[0]) if val_sps else ""
+            except Exception:
+                spsid = ""
+
+            if not studyuid or not spsid:
+                continue
+
+            resp = delete_mwl_by_uid_and_sps(studyuid, spsid)
+            if resp.ok:
+                deleted.append({"studyuid": studyuid, "spsid": spsid})
+            else:
+                errors.append({
+                    "studyuid": studyuid,
+                    "spsid": spsid,
+                    "status": resp.status_code,
+                    "body": resp.text
+                })
+
+    return jsonify({
+        "ok": len(errors) == 0,
+        "deleted": deleted,
+        "errors": errors
+    }), (200 if len(errors) == 0 else 207)
+
 # ---------- API: UI, config, list, create ----------
 @app.route('/')
 def index():
@@ -447,6 +531,72 @@ def create_mwl():
         "odgovorPACS": arch_json
     }), r.status_code
 
+
+# ---------- PDF Import endpoint ----------
+@app.post('/api/import_pdf')
+def import_pdf():
+    file = request.files.get("file")
+    if not file:
+        return jsonify({"ok": False, "error": "No file"}), 400
+    try:
+        pdf = pdfplumber.open(io.BytesIO(file.read()))
+        lines = []
+        for page in pdf.pages:
+            text = page.extract_text() or ""
+            for ln in text.split("\n"):
+                ln = ln.strip()
+                if ln:
+                    lines.append(ln)
+
+        # Heuristika: vrstica struktura
+        # Št. Termin(DD.MM.YYYY HH:MM) Priimek Ime Telefon Dat. rojstva Opomba...
+        out_rows = []
+        date_re = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{4}$")
+        time_re = re.compile(r"^\d{1,2}:\d{2}$")
+
+        for ln in lines:
+            parts = ln.split()
+            if len(parts) < 7:
+                continue
+            # preskoči header in neustrezne vrstice
+            if parts[0].startswith("Št"):
+                continue
+            if not date_re.match(parts[1]) or not time_re.match(parts[2]):
+                continue
+
+            idx = parts[0]
+            exam_date = parts[1]
+            exam_time = parts[2]
+
+            # poišči datum rojstva kasneje v vrstici
+            birth_idx = None
+            for i in range(3, len(parts)):
+                if date_re.match(parts[i]):
+                    birth_idx = i
+                    break
+            if birth_idx is None:
+                continue
+
+            surname = parts[3]
+            given = parts[4] if birth_idx > 4 else ""
+            birth = parts[birth_idx]
+            desc_tokens = parts[birth_idx+1:]
+            desc = " ".join(desc_tokens) if desc_tokens else ""
+
+            row = f"{idx};{surname};{given};{birth};{exam_date};{exam_time};{desc}"
+            out_rows.append(row)
+
+        txt = "\n".join(out_rows)
+        return jsonify({"ok": True, "text": txt})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.get('/logo.png')
+def logo_png():
+    """Serve logo.png from the same directory as this script."""
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return send_from_directory(base_dir, 'logo.png')
+
 # ---------- HTML (SL) ----------
 INDEX_HTML = """
 <!doctype html><html lang="sl"><head>
@@ -474,12 +624,23 @@ small{color:#97a1b3}
 .badge{display:inline-block;padding:2px 8px;border:1px solid #223056;border-radius:999px;background:#0e1630;color:#97a1b3;font-size:12px}
 .hint{font-size:12px;color:#97a1b3}
 </style></head><body>
-<header><h1>DCM4CHEE MWL — Lokalni odjemalec</h1></header><main>
+<header style="display:flex;justify-content:space-between;align-items:center;">
+  <h1>WORKLIST - Lokalni odjemalec</h1>
+  <img src="/logo.png" alt="Logo" style="height:90px;"/>
+</header><main>
 
 <section class="card">
 <h3>Nastavitve strežnika</h3>
-<div class="row">
- <div><label>URL arhiva</label><input id="server_base" value="https://192.168.1.40:30007/dcm4chee-arc"/></div>
+
+<label>Hitre nastavitve</label>
+<select id="cfgPreset" onchange="applyPreset()">
+  <option value="">— ročna nastavitev —</option>
+  <option value="pacs1">PACS 1 (192.168.1.40)</option>
+  <option value="pacs2">PACS 2 (192.168.123.220)</option>
+</select>
+
+<div class="row" style="margin-top:10px">
+ <div><label>URL arhiva</label><input id="server_base" value="https://192.168.123.220:30007/dcm4chee-arc"/></div>
  <div><label>AET delovne liste</label><input id="aet" value="WORKLIST"/></div>
 </div>
 <div class="row">
@@ -495,6 +656,18 @@ small{color:#97a1b3}
  <button class="btn alt" onclick="listItems()">Prikaži MWL elemente</button>
  <span class="badge">Stanje: <span id="statusText">Pripravljeno</span></span>
 </div></section>
+
+<section class="card">
+<h3>Uvoz dnevnega programa</h3>
+<p class="hint">Uvozi CSV ali PDF z dnevnim programom</p>
+<div class="flex" style="margin-top:10px">
+  <button class="btn" onclick="openImportDialog()">Uvozi CSV / PDF</button>
+  <button class="btn alt" onclick="writeImportedRows()">Vpiši</button>
+</div>
+<div id="importInfo" class="hint" style="margin-top:8px">Ni uvoženih podatkov.</div>
+<div id="importTable" style="margin-top:10px;overflow:auto"></div>
+<input type="file" id="importFile" accept=".csv,text/csv,application/pdf" style="display:none" onchange="onImportFileChange(event)"/>
+</section>
 
 <section class="card">
 <h3>Ustvari nov MWL element</h3>
@@ -550,7 +723,42 @@ small{color:#97a1b3}
 
 <script>
 // ---- helpers ----
+var CFG_PRESETS = {
+  pacs1: {
+    server_base: "https://192.168.1.40:30007/dcm4chee-arc",
+    username: "admin",
+    password: "tobi78nLJ5",
+    allow_self_signed: true
+  },
+  pacs2: {
+    server_base: "https://192.168.123.220:30007/dcm4chee-arc",
+    username: "admin",
+    password: "ksenija",
+    allow_self_signed: true
+  }
+};
+
+function applyPreset(){
+  var sel = document.getElementById('cfgPreset');
+  if(!sel) return;
+  var key = sel.value;
+  if(!key) return;
+  var p = CFG_PRESETS[key];
+  if(!p) return;
+  var sb = document.getElementById('server_base');
+  var un = document.getElementById('username');
+  var pw = document.getElementById('password');
+  var as = document.getElementById('allow_self_signed');
+  var aet = document.getElementById('aet');
+  if(sb) sb.value = p.server_base;
+  if(un) un.value = p.username;
+  if(pw) pw.value = p.password;
+  if(as) as.value = p.allow_self_signed ? 'true' : 'false';
+  if(aet) aet.value = 'WORKLIST';
+}
+
 function $(id){ return document.getElementById(id); }
+
 function esc(s){
   return String(s)
     .replace(/&/g,'&amp;')
@@ -559,128 +767,515 @@ function esc(s){
     .replace(/"/g,'&quot;')
     .replace(/'/g,'&#39;');
 }
+
 function log(msg, cls){
-  $('out').innerHTML = '<div class="'+(cls||'')+'">'+msg+'</div>';
-  $('statusText').textContent = (cls==='ok') ? 'OK' : 'Pripravljeno';
+  var out = $('out');
+  if(out){
+    out.innerHTML = '<div class="'+(cls||'')+'">'+msg+'</div>';
+  }
+  var st = $('statusText');
+  if(st){
+    st.textContent = (cls === 'ok') ? 'OK' : 'Pripravljeno';
+  }
 }
+
 // Datum (YYYYMMDD -> DD.MM.YYYY)
 function daToHuman(da){
-  const s = String(da||'').trim();
-  if (/^\d{8}$/.test(s)) return s.slice(6,8)+'.'+s.slice(4,6)+'.'+s.slice(0,4);
+  var s = String(da||'').trim();
+  if (/^\d{8}$/.test(s)){
+    return s.slice(6,8)+'.'+s.slice(4,6)+'.'+s.slice(0,4);
+  }
   return s || '';
 }
+
 // Čas (sprejme HHMM, HHMMSS, HH:MM(:SS), z/ex frakcijami)
 function fmtTime(tm){
   if (tm == null) return '';
-  const s0 = String(tm).trim();
+  var s0 = String(tm).trim();
   if (/^\d{2}:\d{2}(:\d{2})?$/.test(s0)) return s0; // že lepo
-  const digits = s0.replace(/\D/g,'');              // npr. "173000", "1730"
-  if (digits.length < 4) return s0;                  // nimamo vsaj HHMM
-  const hh = digits.slice(0,2);
-  const mm = digits.slice(2,4);
-  const ss = digits.slice(4,6) || '00';
-  const H=+hh, M=+mm, S=+ss;
+  var digits = s0.replace(/\D/g,'');              // npr. "173000", "1730"
+  if (digits.length < 4) return s0;               // nimamo vsaj HHMM
+  var hh = digits.slice(0,2);
+  var mm = digits.slice(2,4);
+  var ss = digits.slice(4,6) || '00';
+  var H = +hh, M = +mm, S = +ss;
   if (!(H>=0 && H<=23 && M>=0 && M<=59 && S>=0 && S<=59)) return s0;
-  return (ss==='00') ? `${hh}:${mm}` : `${hh}:${mm}:${ss}`;
+  return (ss==='00') ? (hh+':'+mm) : (hh+':'+mm+':'+ss);
+}
+
+// ---- Uvoz dnevnega programa (CSV) ----
+var importedRows = [];
+
+function normalizeText(s){
+  if(s == null) return '';
+  var map = {
+    'Č':'C','Ć':'C','Ž':'Z','Š':'S','Đ':'D',
+    'č':'c','ć':'c','ž':'z','š':'s','đ':'d'
+  };
+  var out = '';
+  var str = String(s);
+  for (var i=0; i<str.length; i++){
+    var ch = str.charAt(i);
+    out += map[ch] || ch;
+  }
+  return out.toUpperCase();
+}
+
+function normalizeDateHuman(s){
+  s = String(s || '').trim();
+  if(!s) return '';
+  var m;
+
+  // že v formatu DD.MM.YYYY
+  m = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if(m){
+    var dd = m[1], mm = m[2], yyyy = m[3];
+    if(dd.length === 1) dd = '0' + dd;
+    if(mm.length === 1) mm = '0' + mm;
+    return dd + '.' + mm + '.' + yyyy;
+  }
+
+  // YYYY-MM-DD -> DD.MM.YYYY
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if(m){
+    var yyyy2 = m[1], mm2 = m[2], dd2 = m[3];
+    if(dd2.length === 1) dd2 = '0' + dd2;
+    if(mm2.length === 1) mm2 = '0' + mm2;
+    return dd2 + '.' + mm2 + '.' + yyyy2;
+  }
+
+  // splošen zapis D/M/YYYY ali D-M-YYYY ali D.M.YYYY
+  m = s.match(/^(\d{1,2})[\.\/-](\d{1,2})[\.\/-](\d{4})$/);
+  if(m){
+    var dd3 = m[1], mm3 = m[2], yyyy3 = m[3];
+    if(dd3.length === 1) dd3 = '0' + dd3;
+    if(mm3.length === 1) mm3 = '0' + mm3;
+    return dd3 + '.' + mm3 + '.' + yyyy3;
+  }
+
+  // če ne prepoznamo, pustimo original
+  return s;
+}
+
+function normalizeTimeHuman(s){
+  s = String(s || '').trim();
+  if(!s) return '';
+  var m;
+
+  // že v formatu HH:MM
+  if(/^\d{2}:\d{2}$/.test(s)){
+    return s;
+  }
+
+  // HH:MM(:SS) -> HH:MM
+  m = s.match(/^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/);
+  if(m){
+    var hh = m[1], mm = m[2];
+    if(hh.length === 1) hh = '0' + hh;
+    if(mm.length === 1) mm = '0' + mm;
+    return hh + ':' + mm;
+  }
+
+  // števke brez ločil, npr. "900", "0900", "1230", "13.00"
+  var digits = s.replace(/\D/g,'');
+  if(digits.length === 3 || digits.length === 4){
+    var h, min;
+    if(digits.length === 3){
+      h = digits.charAt(0);
+      min = digits.slice(1);
+    }else{
+      h = digits.slice(0,2);
+      min = digits.slice(2);
+    }
+    if(h.length === 1) h = '0' + h;
+    if(min.length === 1) min = '0' + min;
+    var H = parseInt(h,10), M = parseInt(min,10);
+    if(H>=0 && H<=23 && M>=0 && M<=59){
+      return h + ':' + min;
+    }
+  }
+
+  // če ne prepoznamo, pustimo original
+  return s;
+}
+
+function parseImportedCsv(text){
+  var lines = text.split(/\\r?\\n/);
+  var rows = [];
+  for(var i=0; i<lines.length; i++){
+    var line = lines[i];
+    var trimmed = line.trim();
+    if(!trimmed) continue;
+    var parts = trimmed.split(';');
+    if(parts.length < 7) continue;
+    // preskoči header, če je
+    if((parts[0] || '').trim().indexOf('#') === 0 &&
+       (parts[1] || '').toUpperCase().indexOf('PRIIMEK') !== -1) continue;
+    var idx       = (parts[0] || '').trim();
+    var surname   = normalizeText(parts[1] || '');
+    var given     = normalizeText(parts[2] || '');
+    var birthDate = normalizeDateHuman((parts[3] || '').trim());
+    var examDate  = normalizeDateHuman((parts[4] || '').trim());
+    var examTime  = normalizeTimeHuman((parts[5] || '').trim());
+    var desc      = normalizeText(parts[6] || '');
+    rows.push({
+      idx: idx,
+      surname: surname,
+      given: given,
+      birthDate: birthDate,
+      examDate: examDate,
+      examTime: examTime,
+      desc: desc,
+      station: ''
+    });
+  }
+  return rows;
+}
+
+function renderImportTable(){
+  var info = $('importInfo');
+  var container = $('importTable');
+  if(!container || !info) return;
+  if(!importedRows.length){
+    info.textContent = 'Ni uvoženih podatkov.';
+    container.innerHTML = '';
+    return;
+  }
+  info.textContent = 'Uvoženih vrstic: ' + importedRows.length + '. Izberi UZ1 ali UZ2 za vrstice, ki jih želiš vpisati.';
+  var html = '<table><tr>'
+    + '<th>#</th><th>Priimek</th><th>Ime</th><th>Datum rojstva</th>'
+    + '<th>Datum preiskave</th><th>Čas preiskave</th><th>Opis preiskave</th><th>AE</th>'
+    + '</tr>';
+  for(var i=0; i<importedRows.length; i++){
+    var r = importedRows[i];
+    var ae = r.station || '';
+    html += '<tr>'
+      + '<td>'+esc(r.idx || (i+1))+'</td>'
+      + '<td>'+esc(r.surname)+'</td>'
+      + '<td>'+esc(r.given)+'</td>'
+      + '<td>'+esc(r.birthDate)+'</td>'
+      + '<td>'+esc(r.examDate)+'</td>'
+      + '<td>'+esc(r.examTime)+'</td>'
+      + '<td>'+esc(r.desc)+'</td>'
+      + '<td><select class="import-station" data-idx="'+i+'">'
+      + '<option value=""></option>'
+      + '<option value="UZ1"'+(ae==='UZ1'?' selected':'')+'>UZ1</option>'
+      + '<option value="UZ2"'+(ae==='UZ2'?' selected':'')+'>UZ2</option>'
+      + '</select></td>'
+      + '</tr>';
+  }
+  html += '</table>';
+  container.innerHTML = html;
+  var selects = container.getElementsByClassName('import-station');
+  for(var j=0; j<selects.length; j++){
+    selects[j].addEventListener('change', function(e){
+      var idxStr = e.target.getAttribute('data-idx');
+      var idx = parseInt(idxStr, 10);
+      if(!isNaN(idx) && importedRows[idx]){
+        importedRows[idx].station = e.target.value || '';
+      }
+    });
+  }
+}
+
+function openImportDialog(){
+  var inp = $('importFile');
+  if(!inp){ log('Manjka input za uvoz.', 'err'); return; }
+  inp.value = '';
+  inp.click();
+}
+
+function onImportFileChange(evt){
+  var files = (evt && evt.target && evt.target.files) ? evt.target.files : null;
+  var file = files && files[0];
+  if(!file) return;
+  var name = (file.name||'').toLowerCase();
+
+  // PDF -> pošlji na backend in prejmi umetni CSV tekst
+  if(name.indexOf('.pdf') >= 0){
+    var fd = new FormData();
+    fd.append("file", file);
+    fetch("/api/import_pdf", {
+      method: "POST",
+      body: fd
+    })
+      .then(function(r){ return r.json(); })
+      .then(function(j){
+        if(!j.ok){
+          log("Napaka pri PDF uvozu: " + esc(j.error||'neznano'), "err");
+          return;
+        }
+        importedRows = parseImportedCsv(j.text || '');
+        renderImportTable();
+        log("PDF uspešno uvožen.", "ok");
+      })
+      .catch(function(e){
+        importedRows = [];
+        renderImportTable();
+        log("Napaka PDF: " + esc(String(e)), "err");
+      });
+    return;
+  }
+
+  // CSV pot
+  var reader = new FileReader();
+  reader.onload = function(ev){
+    try{
+      var text = String(ev.target.result || '');
+      importedRows = parseImportedCsv(text);
+      renderImportTable();
+      log('CSV uspešno uvožen.', 'ok');
+    }catch(e){
+      importedRows = [];
+      renderImportTable();
+      log('Napaka pri branju CSV: ' + esc(String(e)), 'err');
+    }
+  };
+  reader.onerror = function(){
+    importedRows = [];
+    renderImportTable();
+    log('Napaka pri branju datoteke.', 'err');
+  };
+  reader.readAsText(file);
+}
+
+function writeImportedRows(){
+  if(!importedRows.length){
+    log('Ni uvoženih vrstic za vpis.', 'err');
+    return;
+  }
+  var rowsToWrite = [];
+  for(var i=0; i<importedRows.length; i++){
+    var r = importedRows[i];
+    if(r.station === 'UZ1' || r.station === 'UZ2'){
+      rowsToWrite.push(r);
+    }
+  }
+  if(!rowsToWrite.length){
+    log('Za nobeno vrstico ni izbran AE (UZ1/UZ2).', 'err');
+    return;
+  }
+
+  var idx = 0;
+  function processNext(){
+    if(idx >= rowsToWrite.length){
+      log('Vnos zaključen za ' + rowsToWrite.length + ' vrstic.', 'ok');
+      listItems();
+      return;
+    }
+    var row = rowsToWrite[idx];
+
+    // Simulacija ročnega vnosa v obrazec
+    if($('surname'))    $('surname').value    = row.surname || '';
+    if($('given'))      $('given').value      = row.given || '';
+    if($('birthDate_h'))$('birthDate_h').value= row.birthDate || '';
+    if($('schedDate_h'))$('schedDate_h').value= row.examDate || '';
+    if($('schedTime_h'))$('schedTime_h').value= row.examTime || '';
+    if($('procDesc'))   $('procDesc').value   = row.desc || '';
+    if($('stationAET')) $('stationAET').value = row.station || '';
+
+    if($('autoPID'))    $('autoPID').checked  = true;
+    if($('autoACC'))    $('autoACC').checked  = true;
+    if($('patientId'))  $('patientId').value  = '';
+    if($('accession'))  $('accession').value  = '';
+
+    // Ustvari MWL za trenutno vrstico, po zaključku nadaljuj na naslednjo
+    if(typeof createItem === 'function'){
+      createItem(function(){
+        idx++;
+        processNext();
+      });
+    } else {
+      log('Funkcija createItem ni definirana.', 'err');
+    }
+  }
+
+  processNext();
 }
 
 // ---- Pretvorbe DA/TM (klient) za pošiljanje ----
 function toDA(h){
   if(!h) return '';
   h = String(h).trim();
-  let m = h.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
-  if(m){ const [_,dd,mm,yyyy]=m; return `${yyyy}${mm}${dd}`; }
+  var m = h.match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
+  if(m){
+    var dd = m[1], mm = m[2], yyyy = m[3];
+    return yyyy+mm+dd;
+  }
   m = h.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-  if(m){ const [_,yyyy,mm,dd]=m; return `${yyyy}${mm}${dd}`; }
-  m = h.match(/^\d{8}$/); if(m) return h;
+  if(m){
+    var yyyy2 = m[1], mm2 = m[2], dd2 = m[3];
+    return yyyy2+mm2+dd2;
+  }
+  m = h.match(/^\d{8}$/);
+  if(m) return h;
   return '';
 }
+
 function toTM(h){
   if(!h) return '';
   h = String(h).trim();
-  let m = h.match(/^(\d{2}):(\d{2})(?::(\d{2}))?$/);
-  if(m){ const [_,HH,MM,SS] = m; return `${HH}${MM}${SS||'00'}`; }
-  m = h.match(/^\d{6}$/); if(m) return h;
-  m = h.match(/^\d{4}$/); if(m) return h + '00';
+  var m = h.match(/^(\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if(m){
+    var HH = m[1], MM = m[2], SS = m[3] || '00';
+    return HH+MM+SS;
+  }
+  m = h.match(/^\d{6}$/);
+  if(m) return h;
+  m = h.match(/^\d{4}$/);
+  if(m) return h + '00';
   return '';
 }
 
-document.addEventListener('DOMContentLoaded', ()=>{ loadStations(); });
+// Inicializacija po nalaganju HTML (skript je na koncu body, zato so elementi že prisotni)
+loadStations();
+renderImportTable();
 
 // ---- Nastavitve ----
 function saveCfg(){
-  const data = {
+  var data = {
     server_base: $('server_base').value.trim().replace(/\/$/,''),
     aet: $('aet').value.trim(),
     username: $('username').value,
     password: $('password').value,
     allow_self_signed: $('allow_self_signed').value === 'true'
   };
-  fetch('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) })
-    .then(r=>r.json())
-    .then(()=> log('Nastavitve shranjene.','ok'))
-    .catch(e=> log('Napaka pri shranjevanju: ' + e, 'err'));
+  fetch('/api/config', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(data)
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(){ log('Nastavitve shranjene.','ok'); })
+    .catch(function(e){ log('Napaka pri shranjevanju: ' + e, 'err'); });
 }
 
 // ---- Station AE ----
 function loadStations(){
-  fetch('/api/stations').then(r=>r.json()).then(j=>{
-    const dl = $('stationList'); dl.innerHTML='';
-    for(const v of (j.items||[])){ const opt=document.createElement('option'); opt.value=v; dl.appendChild(opt); }
-  }).catch(()=>{});
+  fetch('/api/stations')
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      var dl = $('stationList');
+      if(!dl) return;
+      dl.innerHTML='';
+      var items = j.items || [];
+      for(var i=0; i<items.length; i++){
+        var opt = document.createElement('option');
+        opt.value = items[i];
+        dl.appendChild(opt);
+      }
+    })
+    .catch(function(){});
 }
+
 function saveCurrentAE(){
-  const val = ($('stationAET').value||'').trim();
+  var val = ($('stationAET').value||'').trim();
   if(!val){ log('Najprej vnesi AE.','err'); return; }
-  fetch('/api/stations', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({value:val}) })
-    .then(r=>r.json())
-    .then(j=>{
-      const dl = $('stationList'); dl.innerHTML='';
-      for(const v of (j.items||[])){ const opt=document.createElement('option'); opt.value=v; dl.appendChild(opt); }
+  fetch('/api/stations', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({value:val})
+  })
+    .then(function(r){ return r.json(); })
+    .then(function(j){
+      var dl = $('stationList');
+      if(!dl) return;
+      dl.innerHTML='';
+      var items = j.items || [];
+      for(var i=0; i<items.length; i++){
+        var opt = document.createElement('option');
+        opt.value = items[i];
+        dl.appendChild(opt);
+      }
       log('AE shranjen v seznam.','ok');
     })
-    .catch(e=> log('Napaka pri shranjevanju AE: ' + e, 'err'));
+    .catch(function(e){ log('Napaka pri shranjevanju AE: ' + e, 'err'); });
 }
 
 // ---- UI: brisanje (ID-jev ne prikazujemo, jih pa uporabimo v gumbu) ----
 function deleteItem(spsid, studyuid){
   if(!spsid){ log('Manjka SPS ID.','err'); return; }
   if(!confirm('Res želite izbrisati MWL?')) return;
-  const body = studyuid ? {spsid, studyuid} : {spsid};
-  fetch('/api/remove', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })
-    .then(r=>r.text().then(t=>({ok:r.ok,t})))
-    .then(({ok,t})=>{
-      if(!ok) throw new Error(t);
+  var body = studyuid ? {spsid: spsid, studyuid: studyuid} : {spsid: spsid};
+  fetch('/api/remove', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  })
+    .then(function(r){
+      return r.text().then(function(t){
+        return {ok:r.ok, t:t};
+      });
+    })
+    .then(function(res){
+      if(!res.ok) throw new Error(res.t);
       log('<span class="ok">Element izbrisan.</span>','ok');
       listItems();
     })
-    .catch(e=> log('Napaka pri brisanju: ' + esc(String(e)), 'err'));
+    .catch(function(e){ log('Napaka pri brisanju: ' + esc(String(e)), 'err'); });
+}
+
+function deleteAllItems(){
+  if(!confirm('Res želite izbrisati VSE MWL elemente?')) return;
+  fetch('/api/remove_all', {
+    method:'POST'
+  })
+    .then(function(r){
+      return r.text().then(function(t){
+        return {ok:r.ok, t:t};
+      });
+    })
+    .then(function(res){
+      if(!res.ok){
+        log('Napaka pri brisanju vseh: ' + esc(res.t), 'err');
+        return;
+      }
+      var msg = 'Vsi MWL elementi so bili izbrisani.';
+      try{
+        var j = JSON.parse(res.t);
+        if(j && j.errors && j.errors.length){
+          msg = 'Brisanje vseh je zaključeno z napakami pri nekaterih elementih.';
+        }
+      }catch(e){}
+      log(msg, 'ok');
+      listItems();
+    })
+    .catch(function(e){
+      log('Napaka pri brisanju vseh: ' + esc(String(e)), 'err');
+    });
 }
 
 // ---- Prikaz MWL (brez prikaza SPS/Study UID) ----
 function listItems(){
-  $('statusText').textContent = 'Pridobivanje...';
+  var st = $('statusText');
+  if(st) st.textContent = 'Pridobivanje...';
   fetch('/api/list')
-    .then(async r=>{ const txt=await r.text(); if(!r.ok) throw new Error(txt); return txt; })
-    .then(txt=>{
+    .then(function(r){
+      return r.text().then(function(txt){
+        if(!r.ok) throw new Error(txt);
+        return txt;
+      });
+    })
+    .then(function(txt){
       try{
-        const j = JSON.parse(txt);
+        var j = JSON.parse(txt);
         if(!Array.isArray(j) || !j.length){
           log('<span class="muted">Ni najdenih MWL elementov.</span>', 'ok');
           return;
         }
-        let html = '<table><tr><th>Pacient</th><th>ID</th><th>Napotnica</th><th>Modaliteta</th><th>Datum</th><th>Čas</th><th>Postaja</th><th>Briši</th></tr>';
-        for(const it of j){
-          const s=(it.scheduledProcedureStep||[])[0]||{};
-          const dHuman = daToHuman(s.scheduledProcedureStepStartDate||'');
-          const tHuman = fmtTime(s.scheduledProcedureStepStartTime||'');
-          const sps   = s.scheduledProcedureStepID || '';
-          const suid  = it.studyInstanceUID || '';
+        var html = '<table><tr><th>Pacient</th><th>ID</th><th>Opis postopka / preiskave</th><th>Datum</th><th>Čas</th><th>Postaja</th><th>Briši</th></tr>';
+        for(var i=0; i<j.length; i++){
+          var it = j[i];
+          var spsArr = it.scheduledProcedureStep || [];
+          var s = spsArr[0] || {};
+          var dHuman = daToHuman(s.scheduledProcedureStepStartDate||'');
+          var tHuman = fmtTime(s.scheduledProcedureStepStartTime||'');
+          var sps = s.scheduledProcedureStepID || '';
+          var suid = it.studyInstanceUID || '';
           html += '<tr>'
-            + '<td>'+esc(String(it.patientName||'').replace(/\^/g,' '))+'</td>'
+            + '<td>'+esc(String(it.patientName||'').replace(/\\^/g,' '))+'</td>'
             + '<td>'+esc(it.patientId||'')+'</td>'
-            + '<td>'+esc(it.accessionNumber||'')+'</td>'
-            + '<td>'+esc(s.modality||'')+'</td>'
+            + '<td>'+esc(it.procedureDescription||'')+'</td>'
             + '<td>'+esc(dHuman)+'</td>'
             + '<td>'+esc(tHuman)+'</td>'
             + '<td>'+esc(s.scheduledStationAETitle||'')+'</td>'
@@ -688,56 +1283,113 @@ function listItems(){
             + '</tr>';
         }
         html += '</table>';
+        html += '<div style="margin-top:10px;text-align:right;"><button class="btn danger" onclick="deleteAllItems()">Briši vse</button></div>';
         log(html,'ok');
-      }catch{
+      }catch(e){
         log('<pre>'+esc(txt)+'</pre>', 'err');
       }
     })
-    .catch(e=> log('Napaka pri pridobivanju: ' + esc(String(e)), 'err'));
+    .catch(function(e){
+      log('Napaka pri pridobivanju: ' + esc(String(e)), 'err');
+    });
 }
 
+function clearPatientForm(){
+  if($('surname'))     $('surname').value = '';
+  if($('given'))       $('given').value = '';
+  if($('birthDate_h')) $('birthDate_h').value = '';
+  if($('schedDate_h')) $('schedDate_h').value = '';
+  if($('schedTime_h')) $('schedTime_h').value = '';
+  if($('procDesc'))    $('procDesc').value = '';
+  if($('patientId'))   $('patientId').value = '';
+  if($('accession'))   $('accession').value = '';
+  // modality in stationAET pustimo, ker sta običajno stalni za serijo vnosov
+}
 // ---- Ustvarjanje MWL (po uspehu samodejno osveži seznam) ----
-function createItem(){
-  const surname = ($('surname').value||'').trim();
-  const given   = ($('given').value||'').trim();
+function createItem(done){
+  var surname = ($('surname').value||'').trim();
+  var given   = ($('given').value||'').trim();
 
-  const birth_h = ($('birthDate_h').value||'').trim();
-  const sdate_h = ($('schedDate_h').value||'').trim();
-  const stime_h = ($('schedTime_h').value||'').trim();
+  var birth_h = ($('birthDate_h').value||'').trim();
+  var sdate_h = ($('schedDate_h').value||'').trim();
+  var stime_h = ($('schedTime_h').value||'').trim();
 
-  const birth_da = toDA(birth_h);
-  const sched_da = toDA(sdate_h);
-  const sched_tm = toTM(stime_h);
+  var stationAETVal = $('stationAET') ? ($('stationAET').value||'') : '';
+  var autoPIDVal    = $('autoPID') ? $('autoPID').checked : true;
+  var autoACCVal    = $('autoACC') ? $('autoACC').checked : true;
+  var accessionVal  = $('accession') ? ($('accession').value||'') : '';
+  var patientIdVal  = $('patientId') ? ($('patientId').value||'') : '';
+  var procDescVal   = $('procDesc') ? ($('procDesc').value||'') : '';
+  var modalityVal   = $('modality') ? ($('modality').value||'US') : 'US';
 
-  const body = {
+  var birth_da = toDA(birth_h);
+  var sched_da = toDA(sdate_h);
+  var sched_tm = toTM(stime_h);
+
+  var body = {
     patientSurname: surname,
     patientGiven:   given,
     patientName:    '',
-    patientId:      $('patientId').value||'',
+    patientId:      patientIdVal,
     birthDate_da:   birth_da,
-    accession:      $('accession').value||'',
-    autoACC:        $('autoACC').checked,   // <-- NOVO
-    procDesc:       $('procDesc').value||'',
-    modality:       $('modality').value||'US',
+    accession:      accessionVal,
+    autoACC:        autoACCVal,
+    procDesc:       procDescVal,
+    modality:       modalityVal,
     schedDate_da:   sched_da,
     schedTime_tm:   sched_tm,
-    stationAET:     $('stationAET').value||'',
-    autoPID:        $('autoPID').checked
+    stationAET:     stationAETVal,
+    autoPID:        autoPIDVal
   };
 
-  fetch('/api/create',{ method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) })
-    .then(r=>r.text().then(t=>({ok:r.ok,t})))
-    .then(({ok,t})=>{
-      let pid='', acc='';
-      try{ const j=JSON.parse(t); pid=j.dodeljenID||''; acc=j.dodeljenAccession||''; }catch{}
-      if(!ok) throw new Error(t);
-      if(pid){ $('patientId').value = pid; }
-      if(acc && $('autoACC').checked){ $('accession').value = acc; }
-      // samodejno osveži seznam
+  fetch('/api/create',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  })
+    .then(function(r){
+      return r.text().then(function(t){
+        return {ok:r.ok, t:t};
+      });
+    })
+    .then(function(res){
+      var ok = res.ok;
+      var t = res.t;
+      var pid = '';
+      var acc = '';
+      var msg = '';
+      try{
+        var j = JSON.parse(t);
+        pid = j.dodeljenID || '';
+        acc = j.dodeljenAccession || '';
+        if(j && j.odgovorPACS){
+          msg = String(j.odgovorPACS);
+        }
+      }catch(e){}
+      if(!ok){
+        // PACS (dcm4chee) je vrnil napako, npr. 500 Internal Server Error
+        if(msg && msg.indexOf('Internal Server Error') !== -1){
+          log('PACS je vrnil napako 500 (Internal Server Error) pri ustvarjanju MWL. Preveri nastavitve in podatke.', 'err');
+        }else{
+          log('Napaka pri ustvarjanju MWL (HTTP napaka): ' + esc(t), 'err');
+        }
+        if(typeof done === 'function'){ done(); }
+        return;
+      }
+      if(pid && $('patientId')){ $('patientId').value = pid; }
+      if(acc && $('autoACC') && $('autoACC').checked && $('accession')){
+        $('accession').value = acc;
+      }
+      clearPatientForm();
       listItems();
       log('<span class="ok">MWL uspešno ustvarjen.</span>','ok');
+      if(typeof done === 'function'){ done(); }
     })
-    .catch(e=> log('Napaka pri ustvarjanju: ' + esc(String(e)), 'err'));
+    .catch(function(e){
+      // napaka na ravni povezave/JS, ne PACS
+      log('Napaka pri ustvarjanju (povezava ali brskalnik): ' + esc(String(e)), 'err');
+      if(typeof done === 'function'){ done(); }
+    });
 }
 </script>
 </body></html>
