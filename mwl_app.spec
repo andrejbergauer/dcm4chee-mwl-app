@@ -5,12 +5,12 @@ block_cipher = None
 import os
 import sys
 
-# Directory where the script lives
+# Directory where the script lives (repo root)
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
-# Add logo.png as data file (bundled next to .exe)
+# logo.png naj bo zraven mwl_app.py v repozitoriju
 datas = [
-    (os.path.join(script_dir, 'logo.png'), '.'),
+    ('logo.png', '.'),  # skopira logo.png v isti folder kot .exe
 ]
 
 hiddenimports = [
@@ -24,7 +24,7 @@ hiddenimports = [
     'pdfminer.pdfpage',
     'pdfminer.pdfinterp',
     'pdfminer.converter',
-    'pdfminer.cmapdb'
+    'pdfminer.cmapdb',
 ]
 
 a = Analysis(
@@ -53,5 +53,5 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True
+    console=True,
 )
